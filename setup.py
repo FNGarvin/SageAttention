@@ -104,8 +104,11 @@ if not SKIP_CUDA_BUILD:
                 it = it[:-4]
                 compute_capabilities.add(f"{it}+PTX")
             else:
-                if len(it) == 2 and it.isdigit():
-                    it = f"{it[0]}.{it[1]}"
+                if it.isdigit():
+                    if len(it) == 2:
+                        it = f"{it[0]}.{it[1]}"
+                    elif len(it) == 3:
+                        it = f"{it[0]}{it[1]}.{it[2]}"
                 compute_capabilities.add(it)
 
     # If not provided, try to detect from local GPUs
