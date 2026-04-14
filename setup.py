@@ -26,7 +26,7 @@ from setuptools import setup, find_packages
 # Skip CUDA build in CI or when explicitly requested
 SKIP_CUDA_BUILD = (
     os.getenv("SAGEATTN_SKIP_CUDA_BUILD", "0").upper() in {"1", "TRUE", "YES"}
-    or ("sdist" in sys.argv)
+    or (len(sys.argv) > 1 and sys.argv[1] == "sdist" and len(sys.argv) == 2)
 )
 
 ext_modules = []
@@ -55,7 +55,7 @@ if not SKIP_CUDA_BUILD:
         "-U__CUDA_NO_HALF_OPERATORS__",
         "-U__CUDA_NO_HALF_CONVERSIONS__",
         "--use_fast_math",
-        "--threads=8",
+        f"--threads={os.getenv('NVCC_THREADS', '2')}",
         "-Xptxas=-v",
         "-diag-suppress=174",
     ]
@@ -104,8 +104,11 @@ if not SKIP_CUDA_BUILD:
                 it = it[:-4]
                 compute_capabilities.add(f"{it}+PTX")
             else:
-                if len(it) == 2 and it.isdigit():
-                    it = f"{it[0]}.{it[1]}"
+                if it.isdigit():
+                    if len(it) == 2:
+                        it = f"{it[0]}.{it[1]}"
+                    elif len(it) == 3:
+                        it = f"{it[0]}{it[1]}.{it[2]}"
                 compute_capabilities.add(it)
 
     # If not provided, try to detect from local GPUs
@@ -135,9 +138,9 @@ if not SKIP_CUDA_BUILD:
     if nvcc_cuda_version < Version("12.3") and any(cc.startswith("9.0") for cc in compute_capabilities):
         raise RuntimeError(
             "CUDA 12.3 or higher is required for compute capability 9.0.")
-    if nvcc_cuda_version < Version("12.8") and any(cc.startswith("12.0") for cc in compute_capabilities):
+    if nvcc_cuda_version < Version("12.8") and any(cc.startswith("10.0") for cc in compute_capabilities):
         raise RuntimeError(
-            "CUDA 12.8 or higher is required for compute capability 12.0.")
+            "CUDA 12.8 or higher is required for compute capability 10.0.")
 
     # Add target compute capabilities to NVCC flags.
     for capability in compute_capabilities:
@@ -155,13 +158,7 @@ if not SKIP_CUDA_BUILD:
             num = "90a"
         elif capability.startswith("10.0"):
             HAS_SM100 = True
-            num = "100a"
-        elif capability.startswith("12.0"):
-            HAS_SM120 = True
-            num = "120a"
-        elif capability.startswith("12.1"):
-            HAS_SM121 = True
-            num = "121a"
+            num = "100"
         else:
             continue
         NVCC_FLAGS += ["-gencode", f"arch=compute_{num},code=sm_{num}"]
@@ -171,7 +168,7 @@ if not SKIP_CUDA_BUILD:
     # Fused kernels and QAttn variants
     from torch.utils.cpp_extension import CUDAExtension
 
-    if HAS_SM80 or HAS_SM86 or HAS_SM89 or HAS_SM90 or HAS_SM100 or HAS_SM120 or HAS_SM121:
+    if HAS_SM80 or HAS_SM86 or HAS_SM89 or HAS_SM90 or HAS_SM100:
         ext_modules.append(
             CUDAExtension(
                 name="sageattention._qattn_sm80",
@@ -183,7 +180,7 @@ if not SKIP_CUDA_BUILD:
             )
         )
 
-    if HAS_SM89 or HAS_SM90 or HAS_SM100 or HAS_SM120 or HAS_SM121:
+    if HAS_SM89 or HAS_SM90 or HAS_SM100:
         ext_modules.append(
             CUDAExtension(
                 name="sageattention._qattn_sm89",
@@ -201,7 +198,7 @@ if not SKIP_CUDA_BUILD:
             )
         )
 
-    if HAS_SM90:
+    if HAS_SM90 or HAS_SM100:
         ext_modules.append(
             CUDAExtension(
                 name="sageattention._qattn_sm90",
@@ -222,6 +219,8 @@ if not SKIP_CUDA_BUILD:
         )
     )
 
+    from torch.utils.cpp_extension import BuildExtension
+
     # Resolve parallelism from env
     parallel = None
     if 'EXT_PARALLEL' in os.environ:
@@ -238,40 +237,25 @@ if not SKIP_CUDA_BUILD:
     if parallel is None:
         parallel = 4
     # Ensure MAX_JOBS for underlying tooling if not explicitly set
-    os.environ.setdefault('MAX_JOBS', '32')
+    if 'MAX_JOBS' not in os.environ:
+        os.environ['MAX_JOBS'] = str(parallel)
 
-    class BuildExtensionSeparateDir(BuildExtension):
-        build_extension_patch_lock = threading.Lock()
-        thread_ext_name_map = {}
-
+    class BuildExtensionParallel(BuildExtension):
         def finalize_options(self):
             if parallel is not None:
                 self.parallel = parallel
             super().finalize_options()
 
-        def build_extension(self, ext):
-            with self.build_extension_patch_lock:
-                if not getattr(self.compiler, "_compile_separate_output_dir", False):
-                    compile_orig = self.compiler.compile
+    cmdclass = {"build_ext": BuildExtensionParallel} if ext_modules else {}
 
-                    def compile_new(*args, **kwargs):
-                        return compile_orig(*args, **{
-                            **kwargs,
-                            "output_dir": os.path.join(
-                                kwargs["output_dir"],
-                                self.thread_ext_name_map[threading.current_thread().ident]),
-                        })
-                    self.compiler.compile = compile_new
-                    self.compiler._compile_separate_output_dir = True
-            self.thread_ext_name_map[threading.current_thread().ident] = ext.name
-            objects = super().build_extension(ext)
-            return objects
-
-    cmdclass = {"build_ext": BuildExtensionSeparateDir} if ext_modules else {}
+version = '2.2.0'
+suffix = os.getenv("SAGEATTN_VERSION_SUFFIX", "").strip()
+if suffix:
+    version += f"+{suffix}"
 
 setup(
     name='sageattention',
-    version='2.2.0',
+    version=version,
     author='SageAttention team',
     license='Apache 2.0 License',
     description='Accurate and efficient plug-and-play low-bit attention.',
